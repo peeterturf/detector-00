@@ -1,4 +1,5 @@
 import json
+import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -13,8 +14,9 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 
 FLASHSCORE_URL = "https://m.flashscore.info/"
 
-TOKEN = "8863448989:AAEl5PDKf2xKkKLUwdT5bH-yGzIq4gxSSJs"
-CHAT_ID = 614390617
+# Estas dos variables se cargarán desde Render.
+TOKEN = os.getenv("TOKEN", "")
+CHAT_ID = int(os.getenv("CHAT_ID", "0"))
 
 # Revisar cada 5 minutos.
 INTERVALO_SEGUNDOS = 5 * 60
@@ -41,8 +43,6 @@ PALABRAS_AMISTOSOS = (
     "exhibition",
 )
 
-
-# Países que pueden aparecer al comienzo del nombre de la liga.
 CODIGOS_PAISES = {
     "ARGENTINA": "AR",
     "AUSTRALIA": "AU",
@@ -138,7 +138,6 @@ def hora_actual() -> str:
 
 
 def bandera_desde_codigo(codigo: str) -> str:
-    """Convierte AR en 🇦🇷, BR en 🇧🇷, etc."""
     if len(codigo) != 2:
         return "🌍"
 
@@ -197,7 +196,6 @@ def obtener_equipos(enlace_resultado: Tag):
             break
 
         if isinstance(elemento, Tag):
-            # La hora, las tarjetas y las imágenes no son parte del equipo.
             if elemento.name in ("span", "img"):
                 continue
 
@@ -241,8 +239,7 @@ def obtener_partidos_cero_a_cero():
 
     if contenedor is None:
         raise RuntimeError(
-            "Flashscore respondió, pero no apareció el bloque "
-            "de resultados."
+            "Flashscore respondió, pero no apareció el bloque de resultados."
         )
 
     partidos = []
@@ -250,7 +247,6 @@ def obtener_partidos_cero_a_cero():
     for liga_h4 in contenedor.find_all("h4"):
         nombre_completo_liga = limpiar_liga(liga_h4)
 
-        # Ignorar amistosos.
         if es_amistoso(nombre_completo_liga):
             continue
 
@@ -260,7 +256,6 @@ def obtener_partidos_cero_a_cero():
         elemento = liga_h4.find_next_sibling()
 
         while elemento is not None:
-            # Cuando aparece otro h4, comienza otra liga.
             if isinstance(elemento, Tag) and elemento.name == "h4":
                 break
 
@@ -271,7 +266,6 @@ def obtener_partidos_cero_a_cero():
             ):
                 resultado = elemento.get_text(" ", strip=True)
 
-                # Solo partidos finalizados 0-0.
                 if resultado == "0-0":
                     local, visitante = obtener_equipos(elemento)
 
@@ -392,7 +386,6 @@ def revisar_partidos() -> None:
 
         enviar_telegram(partido)
 
-        # Guardar solamente después de que Telegram lo recibió.
         avisados.add(partido_id)
         guardar_avisados(avisados)
 
@@ -404,7 +397,6 @@ def revisar_partidos() -> None:
             f"({partido['liga_completa']})"
         )
 
-        # Pequeña pausa entre mensajes.
         time.sleep(1)
 
     if nuevos == 0:
@@ -418,8 +410,12 @@ def revisar_partidos() -> None:
 # =========================================================
 
 def main() -> None:
-    if TOKEN == "PEGA_ACA_EL_TOKEN_DE_TU_BOT":
-        print("ERROR: todavía tenés que pegar el token del bot.")
+    if not TOKEN:
+        print("ERROR: falta la variable de entorno TOKEN.")
+        return
+
+    if CHAT_ID == 0:
+        print("ERROR: falta la variable de entorno CHAT_ID.")
         return
 
     print("============================================")
