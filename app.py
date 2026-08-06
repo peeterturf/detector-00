@@ -1,8 +1,9 @@
 import json
 import os
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup, NavigableString, Tag
@@ -14,15 +15,28 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 
 FLASHSCORE_URL = "https://m.flashscore.info/"
 
-# Estas dos variables se cargarán desde Render.
 TOKEN = os.getenv("TOKEN", "")
 CHAT_ID = int(os.getenv("CHAT_ID", "0"))
 
-# Revisar cada 5 minutos.
-INTERVALO_SEGUNDOS = 5 * 60
+# Flashscore se consulta cada 5 minutos.
+INTERVALO_CONSULTA_SEGUNDOS = 5 * 60
 
-# Guarda los partidos ya enviados para no repetirlos.
+# Los recordatorios se revisan internamente cada 15 segundos.
+# Esta revisión NO consulta Flashscore y no consume API.
+INTERVALO_RECORDATORIOS_SEGUNDOS = 15
+
+# Días hacia adelante para buscar el próximo partido de la liga.
+DIAS_BUSQUEDA_PROXIMO = 7
+
+# Zona horaria de Argentina.
+ZONA_ARGENTINA = ZoneInfo("America/Argentina/Buenos_Aires")
+
+# Ajuste manual por si Flashscore muestra horarios desplazados.
+# Primero dejalo en 0. Si el horario aparece corrido, después lo ajustamos en Render.
+AJUSTE_HORAS_FLASHSCORE = int(os.getenv("AJUSTE_HORAS_FLASHSCORE", "0"))
+
 ARCHIVO_AVISADOS = Path("avisados.json")
+ARCHIVO_SEGUIMIENTOS = Path("seguimientos.json")
 
 HEADERS = {
     "User-Agent": (
@@ -56,6 +70,7 @@ CODIGOS_PAISES = {
     "CANADA": "CA",
     "CHILE": "CL",
     "CHINA": "CN",
+    "CHINA PR": "CN",
     "COLOMBIA": "CO",
     "COSTA RICA": "CR",
     "CROATIA": "HR",
@@ -77,6 +92,7 @@ CODIGOS_PAISES = {
     "INDIA": "IN",
     "INDONESIA": "ID",
     "IRELAND": "IE",
+    "REPUBLIC OF IRELAND": "IE",
     "ISRAEL": "IL",
     "ITALY": "IT",
     "JAPAN": "JP",
@@ -105,6 +121,7 @@ CODIGOS_PAISES = {
     "SLOVENIA": "SI",
     "SOUTH AFRICA": "ZA",
     "SOUTH KOREA": "KR",
+    "KOREA REPUBLIC": "KR",
     "SPAIN": "ES",
     "SWEDEN": "SE",
     "SWITZERLAND": "CH",
@@ -133,8 +150,12 @@ EMOJIS_REGIONES = {
 # FUNCIONES AUXILIARES
 # =========================================================
 
+def ahora_argentina() -> datetime:
+    return datetime.now(ZONA_ARGENTINA)
+
+
 def hora_actual() -> str:
-    return datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    return ahora_argentina().strftime("%d/%m/%Y %H:%M:%S")
 
 
 def bandera_desde_codigo(codigo: str) -> str:
@@ -166,17 +187,12 @@ def separar_pais_y_liga(nombre_completo: str):
         return "", nombre_completo.strip()
 
     pais, liga = nombre_completo.split(":", 1)
-
     return pais.strip(), liga.strip()
 
 
 def es_amistoso(nombre_liga: str) -> bool:
     texto = nombre_liga.lower()
-
-    return any(
-        palabra in texto
-        for palabra in PALABRAS_AMISTOSOS
-    )
+    return any(palabra in texto for palabra in PALABRAS_AMISTOSOS)
 
 
 def limpiar_liga(h4: Tag) -> str:
@@ -186,6 +202,10 @@ def limpiar_liga(h4: Tag) -> str:
         liga = liga[:-10].strip()
 
     return liga
+
+
+def normalizar_liga(nombre: str) -> str:
+    return " ".join(nombre.lower().replace("–", "-").split())
 
 
 def obtener_equipos(enlace_resultado: Tag):
@@ -198,12 +218,9 @@ def obtener_equipos(enlace_resultado: Tag):
         if isinstance(elemento, Tag):
             if elemento.name in ("span", "img"):
                 continue
-
             texto = elemento.get_text(" ", strip=True)
-
         elif isinstance(elemento, NavigableString):
             texto = str(elemento).strip()
-
         else:
             texto = ""
 
@@ -217,24 +234,41 @@ def obtener_equipos(enlace_resultado: Tag):
         return None, None
 
     local, visitante = texto_partido.rsplit(" - ", 1)
-
     return local.strip(), visitante.strip()
 
 
-# =========================================================
-# LEER FLASHSCORE
-# =========================================================
+def obtener_hora_programada(enlace: Tag):
+    for elemento in enlace.previous_siblings:
+        if isinstance(elemento, Tag) and elemento.name in ("br", "h4"):
+            break
 
-def obtener_partidos_cero_a_cero():
+        if isinstance(elemento, Tag) and elemento.name == "span":
+            texto = elemento.get_text(" ", strip=True)
+            try:
+                return datetime.strptime(texto, "%H:%M").time()
+            except ValueError:
+                return None
+
+    return None
+
+
+def id_desde_enlace(enlace: Tag) -> str:
+    href = enlace.get("href", "")
+    return href.strip("/").split("/")[-1]
+
+
+def descargar_pagina(desplazamiento_dias: int = 0) -> BeautifulSoup:
     respuesta = requests.get(
         FLASHSCORE_URL,
+        params={"d": desplazamiento_dias, "s": 1},
         headers=HEADERS,
         timeout=30,
     )
-
     respuesta.raise_for_status()
+    return BeautifulSoup(respuesta.text, "html.parser")
 
-    soup = BeautifulSoup(respuesta.text, "html.parser")
+
+def obtener_contenedor(soup: BeautifulSoup) -> Tag:
     contenedor = soup.find("div", id="score-data")
 
     if contenedor is None:
@@ -242,6 +276,15 @@ def obtener_partidos_cero_a_cero():
             "Flashscore respondió, pero no apareció el bloque de resultados."
         )
 
+    return contenedor
+
+
+# =========================================================
+# LEER LOS 0-0
+# =========================================================
+
+def obtener_partidos_cero_a_cero(soup: BeautifulSoup):
+    contenedor = obtener_contenedor(soup)
     partidos = []
 
     for liga_h4 in contenedor.find_all("h4"):
@@ -252,7 +295,6 @@ def obtener_partidos_cero_a_cero():
 
         pais, liga = separar_pais_y_liga(nombre_completo_liga)
         bandera = obtener_bandera(pais)
-
         elemento = liga_h4.find_next_sibling()
 
         while elemento is not None:
@@ -268,23 +310,21 @@ def obtener_partidos_cero_a_cero():
 
                 if resultado == "0-0":
                     local, visitante = obtener_equipos(elemento)
+                    partido_id = id_desde_enlace(elemento)
 
-                    if local and visitante:
-                        enlace = elemento.get("href", "")
-                        partido_id = enlace.strip("/").split("/")[-1]
-
-                        if partido_id:
-                            partidos.append(
-                                {
-                                    "id": partido_id,
-                                    "pais": pais,
-                                    "bandera": bandera,
-                                    "liga": liga,
-                                    "liga_completa": nombre_completo_liga,
-                                    "local": local,
-                                    "visitante": visitante,
-                                }
-                            )
+                    if local and visitante and partido_id:
+                        partidos.append(
+                            {
+                                "id": partido_id,
+                                "pais": pais,
+                                "bandera": bandera,
+                                "liga": liga,
+                                "liga_completa": nombre_completo_liga,
+                                "liga_normalizada": normalizar_liga(nombre_completo_liga),
+                                "local": local,
+                                "visitante": visitante,
+                            }
+                        )
 
             elemento = elemento.find_next_sibling()
 
@@ -292,55 +332,185 @@ def obtener_partidos_cero_a_cero():
 
 
 # =========================================================
-# MEMORIA: EVITAR AVISOS REPETIDOS
+# LEER PARTIDOS PROGRAMADOS
 # =========================================================
 
-def cargar_avisados() -> set[str]:
-    if not ARCHIVO_AVISADOS.exists():
-        return set()
+def obtener_programados_de_pagina(
+    soup: BeautifulSoup,
+    fecha_pagina: date,
+):
+    contenedor = obtener_contenedor(soup)
+    programados = []
+
+    for liga_h4 in contenedor.find_all("h4"):
+        nombre_completo_liga = limpiar_liga(liga_h4)
+
+        if es_amistoso(nombre_completo_liga):
+            continue
+
+        pais, liga = separar_pais_y_liga(nombre_completo_liga)
+        elemento = liga_h4.find_next_sibling()
+
+        while elemento is not None:
+            if isinstance(elemento, Tag) and elemento.name == "h4":
+                break
+
+            if (
+                isinstance(elemento, Tag)
+                and elemento.name == "a"
+                and "sched" in elemento.get("class", [])
+            ):
+                local, visitante = obtener_equipos(elemento)
+                hora = obtener_hora_programada(elemento)
+                partido_id = id_desde_enlace(elemento)
+
+                if local and visitante and hora and partido_id:
+                    kickoff = datetime.combine(
+                        fecha_pagina,
+                        hora,
+                        tzinfo=ZONA_ARGENTINA,
+                    ) + timedelta(hours=AJUSTE_HORAS_FLASHSCORE)
+
+                    programados.append(
+                        {
+                            "id": partido_id,
+                            "pais": pais,
+                            "liga": liga,
+                            "liga_completa": nombre_completo_liga,
+                            "liga_normalizada": normalizar_liga(nombre_completo_liga),
+                            "local": local,
+                            "visitante": visitante,
+                            "kickoff": kickoff,
+                        }
+                    )
+
+            elemento = elemento.find_next_sibling()
+
+    return programados
+
+
+def obtener_todos_los_programados():
+    hoy = ahora_argentina().date()
+    programados = []
+
+    for desplazamiento in range(DIAS_BUSQUEDA_PROXIMO + 1):
+        soup = descargar_pagina(desplazamiento)
+        fecha_pagina = hoy + timedelta(days=desplazamiento)
+
+        programados.extend(
+            obtener_programados_de_pagina(
+                soup=soup,
+                fecha_pagina=fecha_pagina,
+            )
+        )
+
+        time.sleep(0.4)
+
+    return programados
+
+
+def buscar_proximo_partido(partido_00: dict, programados: list[dict]):
+    ahora = ahora_argentina()
+    liga_objetivo = partido_00["liga_normalizada"]
+
+    candidatos = [
+        partido
+        for partido in programados
+        if (
+            partido["liga_normalizada"] == liga_objetivo
+            and partido["kickoff"] > ahora
+        )
+    ]
+
+    if not candidatos:
+        return None
+
+    return min(candidatos, key=lambda partido: partido["kickoff"])
+
+
+# =========================================================
+# MEMORIA
+# =========================================================
+
+def cargar_json_lista(ruta: Path) -> list:
+    if not ruta.exists():
+        return []
 
     try:
-        contenido = ARCHIVO_AVISADOS.read_text(encoding="utf-8")
-        datos = json.loads(contenido)
-
-        if isinstance(datos, list):
-            return set(str(item) for item in datos)
-
+        datos = json.loads(ruta.read_text(encoding="utf-8"))
+        return datos if isinstance(datos, list) else []
     except (OSError, json.JSONDecodeError):
-        pass
+        return []
 
-    return set()
+
+def guardar_json_lista(ruta: Path, datos: list) -> None:
+    ruta.write_text(
+        json.dumps(datos, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def cargar_avisados() -> set[str]:
+    return set(str(item) for item in cargar_json_lista(ARCHIVO_AVISADOS))
 
 
 def guardar_avisados(avisados: set[str]) -> None:
-    ARCHIVO_AVISADOS.write_text(
-        json.dumps(
-            sorted(avisados),
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
+    guardar_json_lista(ARCHIVO_AVISADOS, sorted(avisados))
+
+
+def cargar_seguimientos() -> list[dict]:
+    seguimientos = cargar_json_lista(ARCHIVO_SEGUIMIENTOS)
+
+    for seguimiento in seguimientos:
+        if seguimiento.get("kickoff"):
+            seguimiento["kickoff_dt"] = datetime.fromisoformat(
+                seguimiento["kickoff"]
+            )
+
+    return seguimientos
+
+
+def guardar_seguimientos(seguimientos: list[dict]) -> None:
+    salida = []
+
+    for seguimiento in seguimientos:
+        copia = dict(seguimiento)
+        copia.pop("kickoff_dt", None)
+        salida.append(copia)
+
+    guardar_json_lista(ARCHIVO_SEGUIMIENTOS, salida)
+
+
+def agregar_seguimiento(proximo: dict) -> bool:
+    seguimientos = cargar_seguimientos()
+
+    if any(
+        seguimiento.get("partido_id") == proximo["id"]
+        for seguimiento in seguimientos
+    ):
+        return False
+
+    seguimientos.append(
+        {
+            "partido_id": proximo["id"],
+            "pais": proximo["pais"],
+            "liga": proximo["liga"],
+            "local": proximo["local"],
+            "visitante": proximo["visitante"],
+            "kickoff": proximo["kickoff"].isoformat(),
+            "recordatorio_enviado": False,
+        }
     )
+
+    guardar_seguimientos(seguimientos)
+    return True
 
 
 # =========================================================
 # TELEGRAM
 # =========================================================
 
-def enviar_telegram(partido: dict) -> None:
-    if partido["pais"]:
-        linea_pais = f"{partido['bandera']} {partido['pais'].title()}"
-    else:
-        linea_pais = f"{partido['bandera']} Competición internacional"
-
-    mensaje = (
-        "🚨 ALERTA 0-0\n\n"
-        f"{linea_pais}\n"
-        f"🏆 {partido['liga']}\n\n"
-        f"⚽ {partido['local']} 0-0 {partido['visitante']}\n\n"
-        "⏱ Partido finalizado"
-    )
-
+def enviar_mensaje_telegram(mensaje: str) -> None:
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 
     respuesta = requests.post(
@@ -353,7 +523,6 @@ def enviar_telegram(partido: dict) -> None:
     )
 
     respuesta.raise_for_status()
-
     datos = respuesta.json()
 
     if not datos.get("ok"):
@@ -362,34 +531,139 @@ def enviar_telegram(partido: dict) -> None:
         )
 
 
+def construir_alerta_00(partido: dict, proximo: dict | None) -> str:
+    if partido["pais"]:
+        linea_pais = f"{partido['bandera']} {partido['pais'].title()}"
+    else:
+        linea_pais = f"{partido['bandera']} Competición internacional"
+
+    lineas = [
+        "🚨 ALERTA 0-0",
+        "",
+        linea_pais,
+        f"🏆 {partido['liga']}",
+        "",
+        f"⚽ {partido['local']} 0-0 {partido['visitante']}",
+        "",
+        "⏱ Partido finalizado",
+    ]
+
+    if proximo:
+        faltan = proximo["kickoff"] - ahora_argentina()
+        minutos = max(0, int(faltan.total_seconds() // 60))
+        horas, mins = divmod(minutos, 60)
+
+        if horas:
+            texto_falta = f"{horas} h {mins} min"
+        else:
+            texto_falta = f"{mins} min"
+
+        lineas.extend(
+            [
+                "",
+                "━━━━━━━━━━━━━━",
+                "",
+                "🎯 PRÓXIMO PARTIDO DE LA LIGA",
+                f"⚽ {proximo['local']} vs {proximo['visitante']}",
+                (
+                    "🕒 "
+                    f"{proximo['kickoff'].strftime('%d/%m/%Y %H:%M')} "
+                    "(hora Argentina)"
+                ),
+                f"⏳ Faltan aproximadamente {texto_falta}",
+                "",
+                "📌 Seguimiento: más de 0,5 gol en el primer tiempo",
+            ]
+        )
+    else:
+        lineas.extend(
+            [
+                "",
+                "ℹ️ No encontré otro partido programado de esta liga "
+                f"en los próximos {DIAS_BUSQUEDA_PROXIMO} días.",
+            ]
+        )
+
+    return "\n".join(lineas)
+
+
+def enviar_recordatorio(seguimiento: dict) -> None:
+    kickoff = seguimiento["kickoff_dt"]
+
+    mensaje = "\n".join(
+        [
+            "⏰ RECORDATORIO — EMPIEZA EN 1 MINUTO",
+            "",
+            f"🏆 {seguimiento['liga']}",
+            (
+                f"⚽ {seguimiento['local']} "
+                f"vs {seguimiento['visitante']}"
+            ),
+            (
+                "🕒 "
+                f"{kickoff.strftime('%d/%m/%Y %H:%M')} "
+                "(hora Argentina)"
+            ),
+            "",
+            "🎯 Seguimiento: más de 0,5 gol en el primer tiempo",
+        ]
+    )
+
+    enviar_mensaje_telegram(mensaje)
+
+
 # =========================================================
-# REVISIÓN
+# REVISIÓN DE 0-0
 # =========================================================
 
 def revisar_partidos() -> None:
     print(f"\n[{hora_actual()}] Consultando Flashscore...")
 
     avisados = cargar_avisados()
-    partidos = obtener_partidos_cero_a_cero()
+    soup_hoy = descargar_pagina(0)
+    partidos = obtener_partidos_cero_a_cero(soup_hoy)
 
     print(
         f"Partidos finalizados 0-0 encontrados: {len(partidos)}"
     )
 
-    nuevos = 0
+    nuevos_partidos = [
+        partido
+        for partido in partidos
+        if partido["id"] not in avisados
+    ]
 
-    for partido in partidos:
-        partido_id = partido["id"]
+    if not nuevos_partidos:
+        print("No hay nuevos 0-0 para avisar.")
+        return
 
-        if partido_id in avisados:
-            continue
+    print(
+        "Buscando próximos partidos para "
+        f"{len(nuevos_partidos)} nueva(s) alerta(s)..."
+    )
 
-        enviar_telegram(partido)
+    try:
+        programados = obtener_todos_los_programados()
+        print(f"Partidos programados encontrados: {len(programados)}")
+    except Exception as error:
+        print(f"No pude obtener los programados: {error}")
+        programados = []
 
-        avisados.add(partido_id)
+    enviados = 0
+
+    for partido in nuevos_partidos:
+        proximo = buscar_proximo_partido(partido, programados)
+
+        if proximo:
+            agregar_seguimiento(proximo)
+
+        mensaje = construir_alerta_00(partido, proximo)
+        enviar_mensaje_telegram(mensaje)
+
+        avisados.add(partido["id"])
         guardar_avisados(avisados)
 
-        nuevos += 1
+        enviados += 1
 
         print(
             "Alerta enviada: "
@@ -397,12 +671,61 @@ def revisar_partidos() -> None:
             f"({partido['liga_completa']})"
         )
 
+        if proximo:
+            print(
+                "Próximo partido guardado: "
+                f"{proximo['local']} vs {proximo['visitante']} — "
+                f"{proximo['kickoff'].strftime('%d/%m/%Y %H:%M')}"
+            )
+        else:
+            print("No encontré próximo partido para esta liga.")
+
         time.sleep(1)
 
-    if nuevos == 0:
-        print("No hay nuevos 0-0 para avisar.")
-    else:
-        print(f"Nuevas alertas enviadas: {nuevos}")
+    print(f"Nuevas alertas enviadas: {enviados}")
+
+
+# =========================================================
+# REVISIÓN DE RECORDATORIOS
+# =========================================================
+
+def revisar_recordatorios() -> None:
+    seguimientos = cargar_seguimientos()
+
+    if not seguimientos:
+        return
+
+    ahora = ahora_argentina()
+    hubo_cambios = False
+    seguimientos_vigentes = []
+
+    for seguimiento in seguimientos:
+        kickoff = seguimiento["kickoff_dt"]
+
+        # Borra seguimientos viejos después de seis horas.
+        if ahora > kickoff + timedelta(hours=6):
+            hubo_cambios = True
+            continue
+
+        if not seguimiento.get("recordatorio_enviado", False):
+            inicio_ventana = kickoff - timedelta(seconds=90)
+            fin_ventana = kickoff + timedelta(minutes=2)
+
+            if inicio_ventana <= ahora <= fin_ventana:
+                enviar_recordatorio(seguimiento)
+                seguimiento["recordatorio_enviado"] = True
+                hubo_cambios = True
+
+                print(
+                    "Recordatorio enviado: "
+                    f"{seguimiento['local']} vs "
+                    f"{seguimiento['visitante']}"
+                )
+
+        seguimientos_vigentes.append(seguimiento)
+
+    if hubo_cambios:
+        guardar_seguimientos(seguimientos_vigentes)
 
 
 # =========================================================
@@ -420,14 +743,32 @@ def main() -> None:
 
     print("============================================")
     print("Detector Flashscore 0-0 iniciado")
-    print("Revisión automática cada 5 minutos")
+    print("Consulta Flashscore cada 5 minutos")
+    print("Recordatorios revisados cada 15 segundos")
+    print("Próximo partido activado")
+    print("Aviso 1 minuto antes activado")
     print("Amistosos excluidos")
     print("Banderas activadas")
+    print(
+        "Ajuste horario Flashscore: "
+        f"{AJUSTE_HORAS_FLASHSCORE:+d} horas"
+    )
     print("============================================")
 
+    proxima_consulta = 0.0
+
     while True:
+        ahora_monotonic = time.monotonic()
+
         try:
-            revisar_partidos()
+            revisar_recordatorios()
+
+            if ahora_monotonic >= proxima_consulta:
+                revisar_partidos()
+                proxima_consulta = (
+                    time.monotonic()
+                    + INTERVALO_CONSULTA_SEGUNDOS
+                )
 
         except requests.RequestException as error:
             print(f"[{hora_actual()}] Error de conexión: {error}")
@@ -435,8 +776,7 @@ def main() -> None:
         except Exception as error:
             print(f"[{hora_actual()}] Error inesperado: {error}")
 
-        print(f"[{hora_actual()}] Próxima revisión en 5 minutos.")
-        time.sleep(INTERVALO_SEGUNDOS)
+        time.sleep(INTERVALO_RECORDATORIOS_SEGUNDOS)
 
 
 if __name__ == "__main__":
