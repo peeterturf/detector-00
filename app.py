@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -27,6 +28,12 @@ INTERVALO_RECORDATORIOS_SEGUNDOS = 15
 
 # Días hacia adelante para buscar el próximo partido de la liga.
 DIAS_BUSQUEDA_PROXIMO = 7
+
+# Evita alertas viejas que Flashscore publica varias horas tarde.
+# Un partido 0-0 solo genera alerta si comenzó hace menos de este límite.
+MAX_HORAS_DESDE_INICIO_PARA_ALERTAR = float(
+    os.getenv("MAX_HORAS_DESDE_INICIO_PARA_ALERTAR", "4")
+)
 
 # Zona horaria de Argentina.
 ZONA_ARGENTINA = ZoneInfo("America/Argentina/Buenos_Aires")
@@ -252,6 +259,70 @@ def obtener_hora_programada(enlace: Tag):
     return None
 
 
+def obtener_hora_partido(enlace: Tag):
+    """
+    Busca la hora HH:MM asociada al partido, también para partidos finalizados.
+    """
+    for elemento in enlace.previous_siblings:
+        if isinstance(elemento, Tag) and elemento.name in ("br", "h4"):
+            break
+
+        if isinstance(elemento, Tag) and elemento.name == "span":
+            texto = elemento.get_text(" ", strip=True)
+            coincidencia = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", texto)
+
+            if coincidencia:
+                try:
+                    return datetime.strptime(
+                        coincidencia.group(0),
+                        "%H:%M",
+                    ).time()
+                except ValueError:
+                    pass
+
+    return None
+
+
+def datetime_inicio_partido(enlace: Tag, fecha_pagina: date):
+    """
+    Convierte la hora mostrada por Flashscore a hora Argentina.
+    """
+    hora = obtener_hora_partido(enlace)
+
+    if hora is None:
+        return None
+
+    inicio = datetime.combine(
+        fecha_pagina,
+        hora,
+        tzinfo=ZONA_ARGENTINA,
+    ) + timedelta(hours=AJUSTE_HORAS_FLASHSCORE)
+
+    ahora = ahora_argentina()
+
+    if inicio > ahora + timedelta(minutes=30):
+        inicio -= timedelta(days=1)
+
+    return inicio
+
+
+def es_alerta_reciente(inicio: datetime | None) -> bool:
+    """
+    Evita mandar partidos que Flashscore recién publica varias horas tarde.
+    """
+    if inicio is None:
+        return False
+
+    antiguedad = ahora_argentina() - inicio
+
+    if antiguedad.total_seconds() < 0:
+        return False
+
+    return antiguedad <= timedelta(
+        hours=MAX_HORAS_DESDE_INICIO_PARA_ALERTAR
+    )
+
+
 def id_desde_enlace(enlace: Tag) -> str:
     href = enlace.get("href", "")
     return href.strip("/").split("/")[-1]
@@ -283,7 +354,10 @@ def obtener_contenedor(soup: BeautifulSoup) -> Tag:
 # LEER LOS 0-0
 # =========================================================
 
-def obtener_partidos_cero_a_cero(soup: BeautifulSoup):
+def obtener_partidos_cero_a_cero(
+    soup: BeautifulSoup,
+    fecha_pagina: date,
+):
     contenedor = obtener_contenedor(soup)
     partidos = []
 
@@ -311,6 +385,10 @@ def obtener_partidos_cero_a_cero(soup: BeautifulSoup):
                 if resultado == "0-0":
                     local, visitante = obtener_equipos(elemento)
                     partido_id = id_desde_enlace(elemento)
+                    inicio = datetime_inicio_partido(
+                        elemento,
+                        fecha_pagina,
+                    )
 
                     if local and visitante and partido_id:
                         partidos.append(
@@ -320,9 +398,13 @@ def obtener_partidos_cero_a_cero(soup: BeautifulSoup):
                                 "bandera": bandera,
                                 "liga": liga,
                                 "liga_completa": nombre_completo_liga,
-                                "liga_normalizada": normalizar_liga(nombre_completo_liga),
+                                "liga_normalizada": normalizar_liga(
+                                    nombre_completo_liga
+                                ),
                                 "local": local,
                                 "visitante": visitante,
+                                "inicio": inicio,
+                                "reciente": es_alerta_reciente(inicio),
                             }
                         )
 
@@ -620,26 +702,78 @@ def revisar_partidos() -> None:
     print(f"\n[{hora_actual()}] Consultando Flashscore...")
 
     avisados = cargar_avisados()
+    fecha_hoy = ahora_argentina().date()
     soup_hoy = descargar_pagina(0)
-    partidos = obtener_partidos_cero_a_cero(soup_hoy)
+    partidos = obtener_partidos_cero_a_cero(
+        soup_hoy,
+        fecha_hoy,
+    )
 
     print(
         f"Partidos finalizados 0-0 encontrados: {len(partidos)}"
     )
 
-    nuevos_partidos = [
+    desconocidos = [
         partido
         for partido in partidos
         if partido["id"] not in avisados
     ]
 
-    if not nuevos_partidos:
+    if not desconocidos:
         print("No hay nuevos 0-0 para avisar.")
+        return
+
+    nuevos_partidos = []
+    descartados_tarde = 0
+    descartados_sin_hora = 0
+
+    for partido in desconocidos:
+        if partido["inicio"] is None:
+            avisados.add(partido["id"])
+            descartados_sin_hora += 1
+            print(
+                "Descartado 0-0 sin hora legible: "
+                f"{partido['local']} vs {partido['visitante']} "
+                f"({partido['liga_completa']})"
+            )
+            continue
+
+        if not partido["reciente"]:
+            avisados.add(partido["id"])
+            descartados_tarde += 1
+            antiguedad = ahora_argentina() - partido["inicio"]
+            minutos = max(
+                0,
+                int(antiguedad.total_seconds() // 60),
+            )
+            print(
+                "Descartada alerta vieja: "
+                f"{partido['local']} 0-0 {partido['visitante']} — "
+                f"inicio {partido['inicio'].strftime('%d/%m %H:%M')} — "
+                f"hace aprox. {minutos} min"
+            )
+            continue
+
+        nuevos_partidos.append(partido)
+
+    guardar_avisados(avisados)
+
+    if descartados_tarde:
+        print(f"Alertas viejas descartadas: {descartados_tarde}")
+
+    if descartados_sin_hora:
+        print(
+            "0-0 descartados porque Flashscore no mostró una hora "
+            f"legible: {descartados_sin_hora}"
+        )
+
+    if not nuevos_partidos:
+        print("No hay 0-0 recientes para avisar en esta revisión.")
         return
 
     print(
         "Buscando próximos partidos para "
-        f"{len(nuevos_partidos)} nueva(s) alerta(s)..."
+        f"{len(nuevos_partidos)} nueva(s) alerta(s) reciente(s)..."
     )
 
     try:
@@ -666,9 +800,10 @@ def revisar_partidos() -> None:
         enviados += 1
 
         print(
-            "Alerta enviada: "
+            "Alerta enviada EN TIEMPO: "
             f"{partido['local']} 0-0 {partido['visitante']} "
-            f"({partido['liga_completa']})"
+            f"({partido['liga_completa']}) — "
+            f"inicio {partido['inicio'].strftime('%H:%M')}"
         )
 
         if proximo:
@@ -747,6 +882,10 @@ def main() -> None:
     print("Recordatorios revisados cada 15 segundos")
     print("Próximo partido activado")
     print("Aviso 1 minuto antes activado")
+    print(
+        "Filtro anti-alertas-tardías: "
+        f"{MAX_HORAS_DESDE_INICIO_PARA_ALERTAR:g} h desde el inicio"
+    )
     print("Amistosos excluidos")
     print("Banderas activadas")
     print(
