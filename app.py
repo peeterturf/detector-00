@@ -19,13 +19,6 @@ FLASHSCORE_URL = "https://m.flashscore.info/"
 TOKEN = os.getenv("TOKEN", "")
 CHAT_ID = int(os.getenv("CHAT_ID", "0"))
 
-# Flashscore se consulta cada 5 minutos.
-INTERVALO_CONSULTA_SEGUNDOS = 5 * 60
-
-# Los recordatorios se revisan internamente cada 15 segundos.
-# Esta revisión NO consulta Flashscore y no consume API.
-INTERVALO_RECORDATORIOS_SEGUNDOS = 15
-
 # Días hacia adelante para buscar el próximo partido de la liga.
 DIAS_BUSQUEDA_PROXIMO = 7
 
@@ -39,11 +32,10 @@ MAX_HORAS_DESDE_INICIO_PARA_ALERTAR = float(
 ZONA_ARGENTINA = ZoneInfo("America/Argentina/Buenos_Aires")
 
 # Ajuste manual por si Flashscore muestra horarios desplazados.
-# Primero dejalo en 0. Si el horario aparece corrido, después lo ajustamos en Render.
+# Dejar en 0 salvo que sea necesario corregir el horario.
 AJUSTE_HORAS_FLASHSCORE = int(os.getenv("AJUSTE_HORAS_FLASHSCORE", "0"))
 
 ARCHIVO_AVISADOS = Path("avisados.json")
-ARCHIVO_SEGUIMIENTOS = Path("seguimientos.json")
 
 HEADERS = {
     "User-Agent": (
@@ -200,6 +192,53 @@ def separar_pais_y_liga(nombre_completo: str):
 def es_amistoso(nombre_liga: str) -> bool:
     texto = nombre_liga.lower()
     return any(palabra in texto for palabra in PALABRAS_AMISTOSOS)
+
+
+# Lista conservadora: solamente ligas de primera y torneos principales.
+# Se compara país + nombre para evitar confundir ligas homónimas.
+LIGAS_PRIMERA = {
+    "ARGENTINA": {"liga profesional", "primera division", "primera división"},
+    "BRAZIL": {"serie a", "brasileirao betano", "brasileirão"},
+    "ENGLAND": {"premier league"},
+    "SPAIN": {"laliga", "la liga", "primera division", "primera división"},
+    "ITALY": {"serie a"},
+    "GERMANY": {"bundesliga"},
+    "FRANCE": {"ligue 1"},
+    "PORTUGAL": {"liga portugal", "primeira liga"},
+    "NETHERLANDS": {"eredivisie"},
+    "BELGIUM": {"jupiler pro league", "pro league"},
+    "SCOTLAND": {"premiership"},
+    "TURKEY": {"super lig", "süper lig"},
+    "CHILE": {"primera division", "primera división"},
+    "URUGUAY": {"primera division", "primera división"},
+    "COLOMBIA": {"primera a", "liga betplay"},
+    "MEXICO": {"liga mx"},
+    "USA": {"mls"},
+    "UNITED STATES": {"mls"},
+    "RUSSIA": {"premier league"},
+    "JAPAN": {"j1 league"},
+}
+COPAS_PRINCIPALES = {
+    "EUROPE": {"champions league", "europa league", "conference league"},
+    "SOUTH AMERICA": {"copa libertadores", "copa sudamericana"},
+    "WORLD": {"world cup", "fifa club world cup"},
+    "ENGLAND": {"fa cup"},
+    "SPAIN": {"copa del rey"},
+    "ITALY": {"coppa italia"},
+    "GERMANY": {"dfb pokal", "dfb-pokal"},
+    "FRANCE": {"coupe de france"},
+    "ARGENTINA": {"copa argentina"},
+    "BRAZIL": {"copa do brasil"},
+}
+
+
+def liga_permitida(nombre_completo: str) -> bool:
+    if es_amistoso(nombre_completo):
+        return False
+    pais, liga = separar_pais_y_liga(nombre_completo)
+    pais = pais.upper().strip()
+    liga = normalizar_liga(liga)
+    return liga in LIGAS_PRIMERA.get(pais, set()) or liga in COPAS_PRINCIPALES.get(pais, set())
 
 
 def limpiar_liga(h4: Tag) -> str:
@@ -364,7 +403,7 @@ def obtener_partidos_cero_a_cero(
     for liga_h4 in contenedor.find_all("h4"):
         nombre_completo_liga = limpiar_liga(liga_h4)
 
-        if es_amistoso(nombre_completo_liga):
+        if not liga_permitida(nombre_completo_liga):
             continue
 
         pais, liga = separar_pais_y_liga(nombre_completo_liga)
@@ -427,7 +466,7 @@ def obtener_programados_de_pagina(
     for liga_h4 in contenedor.find_all("h4"):
         nombre_completo_liga = limpiar_liga(liga_h4)
 
-        if es_amistoso(nombre_completo_liga):
+        if not liga_permitida(nombre_completo_liga):
             continue
 
         pais, liga = separar_pais_y_liga(nombre_completo_liga)
@@ -540,54 +579,6 @@ def guardar_avisados(avisados: set[str]) -> None:
     guardar_json_lista(ARCHIVO_AVISADOS, sorted(avisados))
 
 
-def cargar_seguimientos() -> list[dict]:
-    seguimientos = cargar_json_lista(ARCHIVO_SEGUIMIENTOS)
-
-    for seguimiento in seguimientos:
-        if seguimiento.get("kickoff"):
-            seguimiento["kickoff_dt"] = datetime.fromisoformat(
-                seguimiento["kickoff"]
-            )
-
-    return seguimientos
-
-
-def guardar_seguimientos(seguimientos: list[dict]) -> None:
-    salida = []
-
-    for seguimiento in seguimientos:
-        copia = dict(seguimiento)
-        copia.pop("kickoff_dt", None)
-        salida.append(copia)
-
-    guardar_json_lista(ARCHIVO_SEGUIMIENTOS, salida)
-
-
-def agregar_seguimiento(proximo: dict) -> bool:
-    seguimientos = cargar_seguimientos()
-
-    if any(
-        seguimiento.get("partido_id") == proximo["id"]
-        for seguimiento in seguimientos
-    ):
-        return False
-
-    seguimientos.append(
-        {
-            "partido_id": proximo["id"],
-            "pais": proximo["pais"],
-            "liga": proximo["liga"],
-            "local": proximo["local"],
-            "visitante": proximo["visitante"],
-            "kickoff": proximo["kickoff"].isoformat(),
-            "recordatorio_enviado": False,
-        }
-    )
-
-    guardar_seguimientos(seguimientos)
-    return True
-
-
 # =========================================================
 # TELEGRAM
 # =========================================================
@@ -667,31 +658,6 @@ def construir_alerta_00(partido: dict, proximo: dict | None) -> str:
         )
 
     return "\n".join(lineas)
-
-
-def enviar_recordatorio(seguimiento: dict) -> None:
-    kickoff = seguimiento["kickoff_dt"]
-
-    mensaje = "\n".join(
-        [
-            "⏰ RECORDATORIO — EMPIEZA EN 1 MINUTO",
-            "",
-            f"🏆 {seguimiento['liga']}",
-            (
-                f"⚽ {seguimiento['local']} "
-                f"vs {seguimiento['visitante']}"
-            ),
-            (
-                "🕒 "
-                f"{kickoff.strftime('%d/%m/%Y %H:%M')} "
-                "(hora Argentina)"
-            ),
-            "",
-            "🎯 Seguimiento: más de 0,5 gol en el primer tiempo",
-        ]
-    )
-
-    enviar_mensaje_telegram(mensaje)
 
 
 # =========================================================
@@ -788,9 +754,6 @@ def revisar_partidos() -> None:
     for partido in nuevos_partidos:
         proximo = buscar_proximo_partido(partido, programados)
 
-        if proximo:
-            agregar_seguimiento(proximo)
-
         mensaje = construir_alerta_00(partido, proximo)
         enviar_mensaje_telegram(mensaje)
 
@@ -821,101 +784,15 @@ def revisar_partidos() -> None:
 
 
 # =========================================================
-# REVISIÓN DE RECORDATORIOS
-# =========================================================
-
-def revisar_recordatorios() -> None:
-    seguimientos = cargar_seguimientos()
-
-    if not seguimientos:
-        return
-
-    ahora = ahora_argentina()
-    hubo_cambios = False
-    seguimientos_vigentes = []
-
-    for seguimiento in seguimientos:
-        kickoff = seguimiento["kickoff_dt"]
-
-        # Borra seguimientos viejos después de seis horas.
-        if ahora > kickoff + timedelta(hours=6):
-            hubo_cambios = True
-            continue
-
-        if not seguimiento.get("recordatorio_enviado", False):
-            inicio_ventana = kickoff - timedelta(seconds=90)
-            fin_ventana = kickoff + timedelta(minutes=2)
-
-            if inicio_ventana <= ahora <= fin_ventana:
-                enviar_recordatorio(seguimiento)
-                seguimiento["recordatorio_enviado"] = True
-                hubo_cambios = True
-
-                print(
-                    "Recordatorio enviado: "
-                    f"{seguimiento['local']} vs "
-                    f"{seguimiento['visitante']}"
-                )
-
-        seguimientos_vigentes.append(seguimiento)
-
-    if hubo_cambios:
-        guardar_seguimientos(seguimientos_vigentes)
-
-
-# =========================================================
 # PROGRAMA PRINCIPAL
 # =========================================================
 
 def main() -> None:
-    if not TOKEN:
-        print("ERROR: falta la variable de entorno TOKEN.")
-        return
-
-    if CHAT_ID == 0:
-        print("ERROR: falta la variable de entorno CHAT_ID.")
-        return
-
-    print("============================================")
-    print("Detector Flashscore 0-0 iniciado")
-    print("Consulta Flashscore cada 5 minutos")
-    print("Recordatorios revisados cada 15 segundos")
-    print("Próximo partido activado")
-    print("Aviso 1 minuto antes activado")
-    print(
-        "Filtro anti-alertas-tardías: "
-        f"{MAX_HORAS_DESDE_INICIO_PARA_ALERTAR:g} h desde el inicio"
-    )
-    print("Amistosos excluidos")
-    print("Banderas activadas")
-    print(
-        "Ajuste horario Flashscore: "
-        f"{AJUSTE_HORAS_FLASHSCORE:+d} horas"
-    )
-    print("============================================")
-
-    proxima_consulta = 0.0
-
-    while True:
-        ahora_monotonic = time.monotonic()
-
-        try:
-            revisar_recordatorios()
-
-            if ahora_monotonic >= proxima_consulta:
-                revisar_partidos()
-                proxima_consulta = (
-                    time.monotonic()
-                    + INTERVALO_CONSULTA_SEGUNDOS
-                )
-
-        except requests.RequestException as error:
-            print(f"[{hora_actual()}] Error de conexión: {error}")
-
-        except Exception as error:
-            print(f"[{hora_actual()}] Error inesperado: {error}")
-
-        time.sleep(INTERVALO_RECORDATORIOS_SEGUNDOS)
+    if not TOKEN or CHAT_ID == 0:
+        raise RuntimeError("Faltan TOKEN o CHAT_ID en los secretos de GitHub")
+    print(f"[{hora_actual()}] Revisión única de Flashscore (GitHub Actions)")
+    revisar_partidos()
+    print("Revisión terminada")
 
 
 if __name__ == "__main__":
