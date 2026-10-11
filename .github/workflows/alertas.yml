@@ -1,0 +1,46 @@
+name: Detector 0-0 simple
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/30 12-23,0-2 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: detector-00-simple
+  cancel-in-progress: false
+
+jobs:
+  detector:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Descargar codigo
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+      - name: Ejecutar detector
+        env:
+          TOKEN: ${{ secrets.TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: python app.py
+      - name: Guardar avisados
+        if: always()
+        run: |
+          if [ -f avisados.json ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add avisados.json
+            if ! git diff --cached --quiet; then
+              git commit -m "Actualizar partidos avisados"
+              git push
+            fi
+          fi
