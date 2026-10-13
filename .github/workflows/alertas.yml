@@ -1,16 +1,18 @@
+
 name: Detector 0-0 simple
-on:
-  workflow_dispatch:
-  schedule:
+
 on:
   workflow_dispatch:
   schedule:
     - cron: "*/15 * * * *"
+
 permissions:
   contents: write
+
 concurrency:
   group: detector-00-simple
   cancel-in-progress: false
+
 jobs:
   detector:
     runs-on: ubuntu-latest
@@ -20,17 +22,21 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: true
+
       - name: Preparar Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Instalar dependencias
         run: pip install -r requirements.txt
+
       - name: Ejecutar detector
         env:
           TOKEN: ${{ secrets.TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: python app.py
+
       - name: Guardar avisados
         if: always()
         run: |
