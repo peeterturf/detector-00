@@ -4,7 +4,7 @@ name: Detector 0-0 simple
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "7,22,37,52 * * * *"
 
 permissions:
   contents: write
@@ -17,6 +17,7 @@ jobs:
   detector:
     runs-on: ubuntu-latest
     timeout-minutes: 8
+
     steps:
       - name: Descargar codigo
         uses: actions/checkout@v4
