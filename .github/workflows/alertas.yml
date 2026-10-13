@@ -3,8 +3,7 @@ name: Detector 0-0 simple
 on:
   workflow_dispatch:
   schedule:
-- cron: "*/15 * * * *"
-
+    - cron: "*/15 * * * *"
 permissions:
   contents: write
 
