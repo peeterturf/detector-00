@@ -2,6 +2,7 @@ import json
 import os
 import re
 import time
+import unicodedata
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -25,7 +26,7 @@ DIAS_BUSQUEDA_PROXIMO = 7
 # Evita alertas viejas que Flashscore publica varias horas tarde.
 # Un partido 0-0 solo genera alerta si comenzó hace menos de este límite.
 MAX_HORAS_DESDE_INICIO_PARA_ALERTAR = float(
-    os.getenv("MAX_HORAS_DESDE_INICIO_PARA_ALERTAR", "4")
+    os.getenv("MAX_HORAS_DESDE_INICIO_PARA_ALERTAR", "30")
 )
 
 # Zona horaria de Argentina.
@@ -194,51 +195,28 @@ def es_amistoso(nombre_liga: str) -> bool:
     return any(palabra in texto for palabra in PALABRAS_AMISTOSOS)
 
 
-# Lista conservadora: solamente ligas de primera y torneos principales.
-# Se compara país + nombre para evitar confundir ligas homónimas.
-LIGAS_PRIMERA = {
-    "ARGENTINA": {"liga profesional", "primera division", "primera división"},
-    "BRAZIL": {"serie a", "brasileirao betano", "brasileirão"},
-    "ENGLAND": {"premier league"},
-    "SPAIN": {"laliga", "la liga", "primera division", "primera división"},
-    "ITALY": {"serie a"},
-    "GERMANY": {"bundesliga"},
-    "FRANCE": {"ligue 1"},
-    "PORTUGAL": {"liga portugal", "primeira liga"},
-    "NETHERLANDS": {"eredivisie"},
-    "BELGIUM": {"jupiler pro league", "pro league"},
-    "SCOTLAND": {"premiership"},
-    "TURKEY": {"super lig", "süper lig"},
-    "CHILE": {"primera division", "primera división"},
-    "URUGUAY": {"primera division", "primera división"},
-    "COLOMBIA": {"primera a", "liga betplay"},
-    "MEXICO": {"liga mx"},
-    "USA": {"mls"},
-    "UNITED STATES": {"mls"},
-    "RUSSIA": {"premier league"},
-    "JAPAN": {"j1 league"},
-}
-COPAS_PRINCIPALES = {
-    "EUROPE": {"champions league", "europa league", "conference league"},
-    "SOUTH AMERICA": {"copa libertadores", "copa sudamericana"},
-    "WORLD": {"world cup", "fifa club world cup"},
-    "ENGLAND": {"fa cup"},
-    "SPAIN": {"copa del rey"},
-    "ITALY": {"coppa italia"},
-    "GERMANY": {"dfb pokal", "dfb-pokal"},
-    "FRANCE": {"coupe de france"},
-    "ARGENTINA": {"copa argentina"},
-    "BRAZIL": {"copa do brasil"},
-}
+# Se admiten todas las ligas adultas, salvo las categorías excluidas.
+# Los filtros se aplican al nombre completo de la competición.
+PATRONES_EXCLUIDOS = (
+    r"\b(?:friendly|friendlies|amistos[oa]s?|exhibition)\b",
+    r"\b(?:women|woman|womens|female|femenin[oa]s?|feminin[oa]s?|ladies|frauen|damen)\b",
+    r"\b(?:u[ -]?(?:1[0-9]|2[0-3])|under[ -]?(?:1[0-9]|2[0-3])|sub[ -]?(?:1[0-9]|2[0-3]))\b",
+    r"\b(?:youth|juvenil(?:es)?|junior(?:s)?|academy|academia|primavera)\b",
+    r"\b(?:reserve(?:s)?|reserva(?:s)?|reserves league|segunda equipe|second team)\b",
+    r"\b(?:futsal|beach soccer)\b",
+)
+
+
+def texto_sin_acentos(texto: str) -> str:
+    return "".join(
+        letra for letra in unicodedata.normalize("NFKD", texto.lower())
+        if not unicodedata.combining(letra)
+    )
 
 
 def liga_permitida(nombre_completo: str) -> bool:
-    if es_amistoso(nombre_completo):
-        return False
-    pais, liga = separar_pais_y_liga(nombre_completo)
-    pais = pais.upper().strip()
-    liga = normalizar_liga(liga)
-    return liga in LIGAS_PRIMERA.get(pais, set()) or liga in COPAS_PRINCIPALES.get(pais, set())
+    nombre = texto_sin_acentos(nombre_completo)
+    return not any(re.search(patron, nombre) for patron in PATRONES_EXCLUIDOS)
 
 
 def limpiar_liga(h4: Tag) -> str:
@@ -669,24 +647,28 @@ def revisar_partidos() -> None:
 
     avisados = cargar_avisados()
     fecha_hoy = ahora_argentina().date()
-    soup_hoy = descargar_pagina(0)
-    partidos = obtener_partidos_cero_a_cero(
-        soup_hoy,
-        fecha_hoy,
-    )
+    partidos = []
+    # Revisar hoy y ayer para cubrir cruces de medianoche y retrasos.
+    for desplazamiento in (-1, 0):
+        fecha_pagina = fecha_hoy + timedelta(days=desplazamiento)
+        soup = descargar_pagina(desplazamiento)
+        encontrados = obtener_partidos_cero_a_cero(soup, fecha_pagina)
+        print(f"{fecha_pagina}: {len(encontrados)} partidos 0-0 admitidos")
+        partidos.extend(encontrados)
 
     print(
         f"Partidos finalizados 0-0 encontrados: {len(partidos)}"
     )
 
+    # Evitar duplicados si Flashscore presenta un partido en ambas páginas.
+    por_id = {partido["id"]: partido for partido in partidos}
     desconocidos = [
-        partido
-        for partido in partidos
+        partido for partido in por_id.values()
         if partido["id"] not in avisados
     ]
 
     if not desconocidos:
-        print("No hay nuevos 0-0 para avisar.")
+        print("No hay nuevos 0-0 para avisar (después de filtros y memoria).")
         return
 
     nuevos_partidos = []
@@ -695,7 +677,6 @@ def revisar_partidos() -> None:
 
     for partido in desconocidos:
         if partido["inicio"] is None:
-            avisados.add(partido["id"])
             descartados_sin_hora += 1
             print(
                 "Descartado 0-0 sin hora legible: "
@@ -705,7 +686,6 @@ def revisar_partidos() -> None:
             continue
 
         if not partido["reciente"]:
-            avisados.add(partido["id"])
             descartados_tarde += 1
             antiguedad = ahora_argentina() - partido["inicio"]
             minutos = max(
@@ -721,8 +701,6 @@ def revisar_partidos() -> None:
             continue
 
         nuevos_partidos.append(partido)
-
-    guardar_avisados(avisados)
 
     if descartados_tarde:
         print(f"Alertas viejas descartadas: {descartados_tarde}")
