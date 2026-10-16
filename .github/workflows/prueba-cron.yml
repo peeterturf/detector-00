@@ -1,0 +1,25 @@
+
+name: Prueba cron 15 minutos
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  prueba:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Comprobar horario
+        run: |
+          echo "PRUEBA AUTOMATICA DE GITHUB"
+          echo "Fecha y hora UTC:"
+          date -u
+          echo "Fecha y hora Argentina:"
+          TZ=America/Argentina/Buenos_Aires date
+          echo "Tipo de ejecucion: ${{ github.event_name }}"
+          echo "Prueba terminada correctamente"
